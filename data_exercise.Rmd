@@ -1,0 +1,368 @@
+---
+title: "Driver's Seat Data Exercise"
+author: "Sam Gass"
+date: '2023-02-13'
+output: html_document
+---
+
+# Setup 
+
+Loading libraries, etc. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = F)
+```
+
+```{r}
+library(DBI)
+library(tidyverse)
+library(sp)
+library(rgdal)
+library(maps)
+library(lubridate)
+library(ggeffects)
+```
+
+# Load Data
+
+To start, I would need to pull the data into my environment from the sql database. I would probably use DBI for this, depending on the database. From an initial look at the final heatmap, it looks like I only need two of these tables, jobs and areas to calculate average hourly pay in certain geographys. Unfortunately, it doesn't look like there are keys linking these two tables so we'll have to do that manually. 
+
+```{r, echo = F, eval = F}
+con <- dbConnect(RSQLite::SQLite(), ":memory:")
+
+jobs <- dbSendQuery(con, 
+                    "SELECT * FROM jobs
+                     LEFT JOIN driver 
+                     ON jobs.driver_id = driver.driver_id
+                     LEFT JOIN employer
+                     ON jobs.employer_id = employer.employer_id")
+
+areas <- dbSendQuery(con, 
+                     "SELECT * FROM areas")
+```
+
+# Data Cleaning
+
+## Get Area for Jobs
+
+The biggest data cleaning task we have here is to attach a geographic area to each job without a key. From an initial look, it seems like the most straightforward way to do this will be to look at the start and end point of the job, and observe whether it matches any of the geographies we have bee provided. If we wanted to be more precise, there is the option of pulling in the entire trip log and IDg which area the car was in for each geographic ping — to save time for now I will just work with pickup and dropoff. 
+
+First I will need to transform the area data to a spatial dataframe, this would depend on how the data is structured within the database but I'll assume here each area is attached to a vector of coordinates that outlines the geography: 
+
+```{r, eval = F}
+# Map over each row of the dataset, exploding out the coordinates so its one row per set of lat/lon
+# Lets assume the lat/lon column looks like this: "{"Lat": [1.00, 2.00, 3.00], "Lon": [5.00, 6.00, 9.00]}"
+areas_coord <- areas %>%
+  pmap(function(...){
+    # this gives us a data frame with the current row
+    data <- as.data.frame(...)
+    
+    # This gives us a list of lats and lons
+    coords <- rjson::fromJSON(data$shape) %>%
+      # And this transforms to a data frame w/ each row a lat/lon point along the border
+      as.data.frame() %>%
+      mutate(area_id = data$area_id, area_name = data$area_name)
+    
+    return(coords)
+    
+  }) %>%
+  
+  # bind all rows together so we have one data frame with every coordinate for each geographic boundary
+  bind_rows()
+
+# This transforms it to a spatial points data frame
+coordinates(areas_coord) <- c("Lat", "Lon")
+
+# This tranforms it to spatial points object
+as(areas_coord,"SpatialPoints")
+```
+
+Now we need a spatialpoints object of the coordinates for the jobs
+
+```{r, eval = F}
+pickup_coords <- job %>%
+  # Select the columns we need
+  select(job_id, pickup_point)
+
+# This transforms it to a spatial points data frame
+coordinates(pickup_coords) <- c("Lat", "Lon")
+
+# This tranforms it to spatial points object
+as(pickup_coords,"SpatialPoints")
+
+# Make sure they are using same projection as areas
+proj4string(pickup_coords) <- proj4string(areas_coord)
+
+# Same for dropoff cords
+dropoff_coords <- job %>%
+  # Select the columns we need
+  select(job_id, dropoff_point) 
+
+# This transforms it to a spatial points data frame
+coordinates(dropoff_coords) <- c("Lat", "Lon")
+
+# This tranforms it to spatial points object
+as(dropoff_coords,"SpatialPoints")
+
+# Make sure they are using same projection as areas
+proj4string(dropoff_coords) <- proj4string(areas_coord)
+```
+
+Now we use the over function from the rgeos package to tell us which geographies each coordinate belonged to
+
+```{r}
+# This should ID which area each coordinate is in. If it is in none it should return NA
+pickup_over  <- over(pickup_coords, areas_coord) %>%
+  setNames(c("Pickup Area", "Pickup Area ID")) %>%
+  cbind(select(pickup_coords, job_id)) 
+
+dropoff_over <- over(dropoff_coords, areas_coord) %>%
+  setNames(c("Dropoff Area", "Dropoff Area ID")) %>%
+  cbind(select(dropoff_coords, job_id))
+
+# Combine pickup and dropoff
+area_ids <- left_join(pickup_over, dropoff_over, by = "job_id")
+```
+
+Now we add pickup and dropoff area for each job which will basically append a pickup and dropoff area for each job: 
+
+```{r}
+jobs <- left_join(jobs, area_ids, by = "job_id")
+```
+
+## Add Date Data
+
+For this analysis, it will be useful to have date variables such as hour and year, we'll use the lubridate package to transform a bunch of the date fields
+
+```{r}
+jobs <- jobs %>%
+  
+  # Transform to date object
+  mutate(
+    # If its not in a weird format this will work
+    pickup_time_utc  = as_date(pickup_time_utc), 
+    dropoff_time_utc = as_date(dropoff_time_utc),
+    pickup_day       = day(pickup_time_utc), 
+    dropoff_day      = day(pickup_time_utc),
+
+    # Get total earnings
+    total_earnings = rowSums(all_of(c("earnings_pay", "earnings_tip", "earnings_incentive")), na.rm = F)
+  ) %>%
+  
+  # Fix the time to be in drivers time zone
+  mutate(
+    pickup_time_driver_tz = with_tz(pickup_time_utc, timezone), 
+    dropoff_time_driver_tz = with_tz(dropoff_time_utc, timezone)
+  ) %>%
+  
+  mutate(
+    pickup_hr      = hour(pickup_time_driver_tz), 
+    dropoff_hr     = hour(dropoff_time_driver_tz), 
+    pickup_minute  = minute(pickup_time_driver_tz), 
+    dropoff_minute = minute(dropoff_time_driver_tz)
+  ) 
+```
+
+## Get earnings in each hour
+
+```{r}
+# One way to calculate earnings in hours is to split rides that traverse multiple hours based on percentage of time they spent in each hour. To do this I nested the dataframe into one job per row, and looped through the data to create a row for each job/hour combination. I then calculated total earned in that hour as a percentage of the total earned (based on percentage of minutes)
+  
+jobs <- jobs %>%
+  
+  group_by(job_id) %>%
+  
+  nest() %>%
+  
+  mutate(data = map(data, function(job){
+    
+    # first we need to figure out all of the hours
+    pick <- pull(data, pickup_hr)
+    drop <- pull(data, dropoff_hr)
+    
+    # If they are in the same hour we just need one hour
+    if(drop == pick){
+      hours <- c(pick)
+    } else if(drop > pick) {
+      # This returns a vector from pick to drop
+      hours <- drop:pick
+      days  <- rep(data$pickup_day[[1]], length(hours))
+     # Otherwise we need to get all hours up to 24 then 1 to the dropoff
+     } else {
+       hours <- c(pick:24, 0:drop)
+       
+       # We need a vector of days attached to the correct hour. So pickup days are repeated until midnight, then dropoff days are used for anything past midnight
+       pickup_days <- c(rep(data$pickup_day[[1]], 24 - pick))
+       days <- c(pickup_days, rep(data$dropoff_day[[1]], length(hours) - length(pickup_days)))
+     }
+    
+    # Now create a row for every hour
+    hours <- data.frame(
+      hour = hours, 
+      day  = days, 
+      job_id = rep(job$job_id, length(hours))
+    )
+    
+    # Now join the job data to hours, which will give us a row for each day/hour combination
+    job <- full_join(job, hours, by = job_id) %>%
+      mutate(total_mins_this_hour = case_when(
+        
+        # If its only over one hour
+        nrow(.) == 1 ~ dropoff_min - pickup_min, 
+        
+        # If there is more than one hour in the ride/delivery
+        hour == pick & nrow(.) > 1 ~ 60 - job$pickup_min[[1]], 
+        hour == drop & nrow(.) > 1 ~ job$dropoff_min[[1]], 
+        
+        # All full hours between pickup and dropoff
+        T ~ 60
+      )) %>%
+      mutate(total_mins   = dropoff_time_driver_tz - pickup_time_driver_tz, 
+             pct_of_ride  = total_mins_this_hour/total_mins, 
+             total_earned = pct_of_ride * total_earned) %>%
+      
+      return()
+    
+  })) %>%
+  
+  unnest(data)
+
+# Now we have a data set with one column for each hour/day combination a ride or order traversed with the total earned in that hour
+```
+
+# Identify Outliers 
+
+Outliers are going to negatively effect our averages and make the statistics less useful for the drivers. Normally I would use a couple of methods to test out which ones seemed to be more accurately id-ing outliers then used the one that was working better to drop observations
+
+There are a few ways to deal with outliers here, I would probably start with the simplest which is dropping, considering the time restrictions but a few others to look into would be: 
+
+* Standardizing the incentive pay variable in high-earning jobs to bring it closer to the average
+* Weighting observations and using a weighted average
+
+## Z Score
+
+```{r}
+# Could also do this by day/hour
+avg_earn <- mean(jobs$total_earned, na.rm = T)
+sd_earn  <- sd(jobs$total_earned, na.rm = T)
+
+jobs <- jobs %>%
+  mutate(z_score_earned = (total_earned - avg_earn) / sd_earn) %>%
+  # z score above 3 is usually considered an outlier
+  mutate(z_score_outlier = ifelse(z_score_earned > 3, 1, 0))
+```
+
+## IQR
+
+```{r}
+q1  <- quantile(jobs$total_earned)[[2]]
+q3  <- quantile(jobs$total_earned)[[4]]
+iqr <- q3 - q1
+
+jobs <- jobs %>%
+  mutate(iqr_outlier = ifelse(total_earned < q1 - 1.5 * iqr | total_earned > q3 + 1.5 * iqr, 1, 0))
+```
+
+I would then take a look at the observations marked as outliers for each and decide which score was a better fit
+
+```{r}
+# Drop outliers
+jobs <- jobs %>%
+  filter(z_score_outlier == 0)
+```
+
+# Identify Errors
+
+We want to comb the data to look for weird data points that are potentially errors here. I have a few examples of what I would look for initially. Because of time restrictions I limited the number of things I looked at here
+
+```{r}
+jobs <- jobs %>%
+  
+  mutate(total_time = dropoff_time_utc - pickup_time_utc) 
+```
+
+```{r}
+jobs <- jobs %>%
+  
+  # Drop rides/orders longer than 6 hours for rideshare and two hours for 
+  filter(!total_time > 360 & is_rideshare)
+  filter(!total_time > 120 & is_delivery)
+
+  # Drop where dropoff is later than pickup
+  filter(!dropoff_time_utc > pickup_time_utc) %>%
+    
+  # Drop duplicate jobs/hours (this is really just dropping dupes from the original)
+  filter(!duplicated(c(job_id, hour, day))) %>%
+  
+  # Drop jobs with more than three areas
+  group_by(job_id) %>%
+  mutate(total_areas = n_distinct(area)) %>%
+  ungroup() %>%
+  filter(total_areas < 3) %>%
+    
+  # Drop where one driver has multiple jobs at the same time (ran out of time to do this but I would probably look at where two jobs are in the same hour and the minutes overlap)
+  
+```
+
+# Calculate Averages
+
+## Standard way
+
+Just to set a baseline, I'm going to start by doing a very simple average calculation here
+
+```{r}
+# First lets get a total by hour for each person/date
+total_by_hour <- jobs %>%
+  group_by(driver_id, date, hour) %>%
+  summarise(total_earned = sum(total_earned, na.rm = T))
+
+# Then get the average over all hours
+avg_by_hour <- total_by_hour %>%
+  group_by(day, hour, area) %>%
+  summarise(avg_earned = mean(total_earned, na.rm = T), 
+            total_observations = n())
+```
+
+
+I would then take a look to see what came out of that to see if it met my expectations, what might be going on with weird observations, how many observations we have per row, etc.
+
+## Using a model
+
+Another way we can get averages would be to use a model, then predict earnings for a day/hour combination using the model, which if we do not use covariates in the model will be the average. 
+
+If we add weights to the model, specifically Huber weights here, it will account for how much of an outlier each observation is and give us a more normalized prediction for that day/hour combination: 
+
+```{r}
+jobs <- jobs %>%
+  mutate(day_hour = paste(area, day, hour, sep = " "))
+
+wgt_mod <- rlm(total_earned ~ day_hour * area, data = jobs)
+wgt     <- data.frame(usage = jobs$total_earned, resid = wgt_mod$resid, weight = wgt_mod$w)
+
+jobs <- cbind(jobs, wgt)
+```
+
+Now we can use these weights in our model or to get a weighted average
+
+```{r}
+# Interactive effect gives us effect for only that earea
+mod <- lm(total_earned ~ day_hour * area, weights = jobs$wgt)
+
+# then we use the ggpredict package to get predictions and margins for each combination of hour and area with standard errors
+preds <- ggpredict(mod, c("day_hour", "area"))
+```
+
+# Dropping Averages
+
+One of the last steps would be to determine if we have enough information to actually give specific numbers to a user in an area. This is subjective, but I would approach it by using the standard errors given to us from the ggpredict function to calculate confidence intervals (90% or 95%). We can then decide as a team what range of predictions we are comfortable with. So we would set a certain threshold (maybe 5$ with 90% confidence) and drop obervations that have wider cis than that
+
+```{r}
+preds <- preds %>%
+  mutate(keep = ifelse(conf_high - total_earned > 5, 0, 1)) %>%
+  mutate(average_earned = case_when(
+    keep == 1 ~ total_earned, 
+    T ~ NA_complex_
+  ))
+```
+
+
